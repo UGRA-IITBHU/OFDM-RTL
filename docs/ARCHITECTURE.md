@@ -143,13 +143,13 @@ wrapper does the latter (§7).
                       ┌──────────────────────┐
                       │ zc_sequence_generator│  combinational LUT
                       │   (src/zc_seq.v)     │──── zc_seq_cplx [2047:0] ─────┐
-                      └──────────────────────┘                              │
+                      └──────────────────────┘                               │
                                                                              ▼
- qpsk_bits ┌──────────────────┐ qpsk_symbol_cplx ┌───────────────────────────────┐
+ qpsk_bits ┌──────────────────┐ qpsk_symbol_cplx ┌──────────────────────────────────┐
  [127:0] ─►│ qpsk_signal_128  │────[2047:0]─────►│ parameterized_map_to_subcarriers │
-           │ 64× qpsk_signal  │   (1 cycle reg)  │   (src/map_to_subcarriers.v)  │
-           └──────────────────┘                  │   sync / ref_sym / header ◄───┼── sym_idx (FSM)
-                                                 └───────────────┬───────────────┘
+           │ 64× qpsk_signal  │   (1 cycle reg)  │   (src/map_to_subcarriers.v)     │
+           └──────────────────┘                  │   sync / ref_sym / header ◄──────┼── sym_idx (FSM)
+                                                 └───────────────┬──────────────────┘
                                                     subcarriers  │ [2047:0]  (1 cycle reg)
                                                                  ▼
                                                  ┌───────────────────────────────┐
@@ -302,7 +302,127 @@ When `done` sets, the wrapper holds the core in reset; because `ofdm_frame`
 has no reset of its own, the captured frame stays readable. A re-run
 **requires** `CTRL = 0` first.
 
-## 9. Verification
+## 9. ASIC top — SPI in, DAC out (`asic/`)
+
+For a chip, the core's 128-bit input and 10,240-bit output cannot go to pins.
+`asic/ofdm_asic_top.v` puts the same verified transmit chain behind an SPI
+slave for input and an I/Q DAC interface for output.
+
+```
+ SPI ──► spi_slave_regs ──► QPSK0..15, CTRL, GAIN
+                                │
+  zc / qpsk / map ──► p2s ──► ifft_64 ──► frame_mem (256 × 32 bit) ──► DAC pins
+                                          written natural order        CP added on read
+```
+
+`add_cp`, `serial_to_parallel` and the 10,240-bit `ofdm_frame` register are
+**not** used. The IFFT output goes into a 256-word memory (4 symbols × 64
+samples, ~8 Kbit, no reset, registered read, so it maps to an SRAM macro or
+latch array), and the cyclic prefix is produced by the read order: samples
+48–63, then 0–63, of each symbol.
+
+The whole frame is generated before playback starts. The chain needs ~267
+clk cycles per symbol but a symbol is only 80 DAC samples, so streaming
+straight from the IFFT would leave gaps in the analog waveform. Playing from
+memory gives 320 back-to-back samples at a constant rate.
+
+### Parameters
+
+| Parameter           | Default | Meaning                                        |
+|---------------------|---------|------------------------------------------------|
+| `DAC_W`             | 12      | DAC bits per rail (I and Q), 1–16              |
+| `DAC_DIV`           | 2       | clk cycles per DAC sample, ≥ 2                 |
+| `DAC_OFFSET_BINARY` | 0       | 0: two's complement, 1: offset binary          |
+
+Out-of-range values fail elaboration deliberately.
+
+### Pins
+
+| Pin            | Dir | Description |
+|----------------|-----|-------------|
+| `clk`          | in  | system clock |
+| `rst_n`        | in  | active-low reset; asserts asynchronously, released synchronously inside |
+| `spi_sclk`     | in  | SPI clock, mode 0, ≤ f_clk / 8 |
+| `spi_cs_n`     | in  | SPI chip select, active low |
+| `spi_mosi`     | in  | SPI data in, MSB first |
+| `spi_miso`     | out | SPI data out, MSB first |
+| `spi_miso_oe`  | out | pad output enable for MISO, high while selected (not a pin) |
+| `dac_i[DAC_W-1:0]` | out | I (real) DAC code |
+| `dac_q[DAC_W-1:0]` | out | Q (imag) DAC code |
+| `dac_clk`      | out | DAC latch clock, f_clk / `DAC_DIV` |
+| `tx_en`        | out | high while frame samples are on the DAC (RF front-end enable) |
+| `frame_sync`   | out | high during sample 0 of each frame |
+
+With `DAC_W = 12`: 5 inputs + 28 outputs = **33 pads**, plus power.
+
+### SPI protocol
+
+Mode 0 (CPOL = 0, CPHA = 0), MSB first. One transaction:
+
+```
+CS_n low │ command byte {rw, addr[6:0]} │ data byte │ data byte │ … │ CS_n high
+           rw = 1 read, 0 write           addr        addr+1
+```
+
+The address auto-increments after every data byte, so the 16 QPSK bytes go
+in one burst. On a read, MISO carries the register value during each data
+byte; MOSI is ignored.
+
+| Addr          | Name     | Access | Contents |
+|---------------|----------|--------|----------|
+| `0x00`        | CTRL     | RW     | bit0 START (write 1, self-clearing, reads 0); bit1 REPEAT |
+| `0x01`        | STATUS   | RO     | bit0 gen_busy, bit1 tx_active, bit2 frame_valid |
+| `0x02`–`0x11` | QPSK0–15 | RW     | QPSKb = `qpsk_bits[8b+7 : 8b]` |
+| `0x12`        | ID       | RO     | `0xDA` |
+| `0x13`        | GAIN     | RW     | bits[2:0]: output gain 2^GAIN, saturating |
+
+Bit mapping inside `qpsk_bits` is the same as §4: subcarrier `k` uses
+`qpsk_bits[2k]` for I and `qpsk_bits[2k+1]` for Q.
+
+### Sending a frame
+
+```
+SPI write 0x02.. : 16 payload bytes (burst)
+SPI write 0x13   : GAIN (optional)
+SPI write 0x00   : 0x01  (START)        or 0x03 (START + REPEAT)
+                   ~1,070 clk cycles: frame generated, STATUS.gen_busy = 1
+                   320 samples on the DAC, tx_en = 1, frame_sync on sample 0
+                   DAC returns to zero, tx_en = 0, STATUS = 0x04
+```
+
+- **REPEAT = 1** replays the stored frame back-to-back with no gap. Clearing
+  REPEAT stops playback at the end of the current frame.
+- **START while playing** aborts playback and regenerates (e.g. new payload).
+  START while a frame is being generated is ignored, so the FFT always sees
+  whole symbols.
+- The payload is snapshotted at START, so SPI writes during generation do not
+  corrupt the frame in flight.
+
+### DAC output
+
+```
+clk        ┌┐┌┐┌┐┌┐┌┐┌┐┌┐┌┐        DAC_DIV = 2
+dac_clk    ──┐ ┌─┐ ┌─┐ ┌─┐ ┌──      DAC latches on the rising edge
+             └─┘ └─┘ └─┘ └─┘
+dac_i/q    ══X═══X═══X═══X═══      changes on the edge where dac_clk falls
+             s0  s1  s2  s3
+```
+
+Data changes on the clk edge where `dac_clk` falls, and `dac_clk` rises at
+least one clk cycle later, so the DAC gets ≥ 1 clk cycle of setup and hold.
+Sample rate = f_clk / `DAC_DIV`; e.g. 100 MHz clk, `DAC_DIV = 2` → 50 MS/s,
+and a frame takes 6.4 µs on air.
+
+Sample conversion, per rail: Q1.15 value × 2^GAIN, saturated to 16 bits,
+top `DAC_W` bits kept (truncation), MSB inverted if offset binary. Idle
+level is code 0 (two's complement) or mid-scale `100…0` (offset binary).
+
+Because the IFFT scales by 1/64, a typical frame uses only a small part of
+the Q1.15 range at GAIN = 0. Raising GAIN by 1 doubles the amplitude (6 dB)
+and recovers one bit of DAC resolution, at the cost of clipping the rare
+high peaks.
+
+## 10. Verification
 
 | Testbench                      | DUT                       | Check type                               |
 |--------------------------------|---------------------------|------------------------------------------|
@@ -315,13 +435,14 @@ has no reset of its own, the captured frame stays readable. A re-run
 | `tb_ofdm_frame.v`              | full core                 | generated golden table, ±tolerance       |
 | `tb_full.v`                    | full core                 | live `real`-arithmetic IFFT model        |
 | `tb_ofdm_axi_lite.v`           | AXI wrapper + core        | 320-word bit-exact table, re-run         |
+| `tb_ofdm_asic_top.v`           | ASIC top (SPI + DAC)      | DAC stream bit-exact vs `ofdm_generate_frame` run alongside; 12-bit offset-binary variant; GAIN, REPEAT, abort |
 
 Also: `fpga/check_frame.py` (numpy model) passed on ZedBoard hardware at
 ≤1.6 LSB error per symbol.
 
 ---
 
-## 10. Design review (2026-10-27)
+## 11. Design review (2026-10-27)
 
 **Method:** read every RTL file in the chain and the AXI wrapper, compared
 stage by stage with `ofdm_hls.cc.cpp`, and ran the full lint and every

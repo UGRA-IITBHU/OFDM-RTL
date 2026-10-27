@@ -34,7 +34,7 @@ jobs:
       # file is include-guarded, so listing src/*.v alongside it is safe.
       - name: Compile and Syntax Check All Modules Together
         run: |
-          iverilog -Wall -t null -I src full.v src/*.v fpga/*.v testbenches/*.v
+          iverilog -Wall -t null -I src full.v src/*.v fpga/*.v asic/*.v testbenches/*.v
 
       # Timescale-inheritance warnings are expected and non-fatal: several RTL
       # files predate this repo and carry no `timescale directive.
@@ -51,8 +51,9 @@ jobs:
           iverilog -I src -o /tmp/t.vvp full.v                  testbenches/tb_ofdm_frame.v  && vvp /tmp/t.vvp | grep -q "ALL OFDM FRAME TESTS PASSED"
           iverilog -I src -o /tmp/t.vvp full.v                  testbenches/tb_full.v        && vvp /tmp/t.vvp | grep -q "ALL OFDM GENERATE_FRAME TESTS PASSED"
           iverilog -I src -o /tmp/t.vvp full.v fpga/ofdm_axi_lite.v testbenches/tb_ofdm_axi_lite.v && vvp /tmp/t.vvp | grep -q "ALL OFDM AXI-LITE TESTS PASSED"
+          iverilog -I src -o /tmp/t.vvp full.v asic/spi_slave_regs.v asic/ofdm_asic_top.v testbenches/tb_ofdm_asic_top.v && vvp /tmp/t.vvp | grep -q "ALL OFDM ASIC TOP TESTS PASSED"
 
-      # Verilator -Wall must be warning-free on both tops. Note -Isrc with no
+      # Verilator -Wall must be warning-free on all three tops. Note -Isrc with no
       # space: Verilator does not accept "-I src". Intentional warnings are
       # waived inline next to the code they cover (see AGENTS.md); nothing is
       # waived here, so a new warning fails the build.
@@ -61,3 +62,6 @@ jobs:
           set -e
           verilator --lint-only -Wall -Isrc --top-module ofdm_generate_frame full.v
           verilator --lint-only -Wall -Isrc --top-module ofdm_axi_lite fpga/ofdm_axi_lite.v full.v
+          ASIC_SRC="asic/ofdm_asic_top.v asic/spi_slave_regs.v src/zc_seq.v src/qpsk_signal.v src/qpsk_signal_128.v src/map_to_subcarriers.v src/parallel_to_serial.v src/ifft_64.v"
+          verilator --lint-only -Wall -Isrc --top-module ofdm_asic_top $ASIC_SRC
+          verilator --lint-only -Wall -Isrc --top-module ofdm_asic_top -GDAC_W=16 -GDAC_DIV=3 -GDAC_OFFSET_BINARY=1 $ASIC_SRC

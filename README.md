@@ -27,6 +27,7 @@ qpsk_signal_128 -> map_to_subcarriers -> parallel_to_serial
 | `src/` | all RTL, including the vendored r22sdf FFT core |
 | `testbenches/` | self-checking testbenches |
 | `fpga/` | AXI-Lite wrapper, Vitis bare-metal app, host checker |
+| `asic/` | ASIC top: SPI slave input, I/Q DAC output |
 
 Module names often do **not** match filenames — `src/zc_seq.v` defines
 `zc_sequence_generator`, `src/add_cp.v` defines `parameterized_add_cp`, and so
@@ -94,6 +95,23 @@ Accuracy against the floating-point model:
 payload; `testbenches/tb_ofdm_frame.v` compares against a generated table of
 absolute values. They are independent on purpose — agreement between them is
 what makes the end-to-end result meaningful.
+
+## ASIC top (SPI in, DAC out)
+
+`asic/ofdm_asic_top.v` wraps the same transmit chain for a chip: payload and
+control over a mode-0 SPI slave (`asic/spi_slave_regs.v`), output on parallel
+I/Q DAC pins (`dac_i`, `dac_q`, `dac_clk`, `tx_en`, `frame_sync`). The frame is
+built in a 256 x 32-bit memory and played out gaplessly with the cyclic prefix
+added on read. Pins, SPI register map and DAC timing are in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#9-asic-top--spi-in-dac-out-asic).
+
+```sh
+iverilog -I src -o /tmp/sim.vvp full.v asic/spi_slave_regs.v asic/ofdm_asic_top.v \
+                                  testbenches/tb_ofdm_asic_top.v && vvp /tmp/sim.vvp
+verilator --lint-only -Wall -Isrc --top-module ofdm_asic_top asic/ofdm_asic_top.v \
+    asic/spi_slave_regs.v src/zc_seq.v src/qpsk_signal.v src/qpsk_signal_128.v \
+    src/map_to_subcarriers.v src/parallel_to_serial.v src/ifft_64.v
+```
 
 ## FPGA bring-up (Zynq-7000 / ZedBoard)
 
